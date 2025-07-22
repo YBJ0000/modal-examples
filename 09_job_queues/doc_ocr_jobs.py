@@ -34,72 +34,40 @@ app = modal.App("example-doc-ocr-jobs")
 # We also define the dependencies for our Function by specifying an
 # [Image](https://modal.com/docs/guide/images).
 
-inference_image = modal.Image.debian_slim(python_version="3.12").pip_install(
-    "accelerate==0.28.0",
-    "huggingface_hub[hf_transfer]==0.27.1",
-    "numpy<2",
-    "tiktoken==0.6.0",
-    "torch==2.5.1",
-    "torchvision==0.20.1",
-    "transformers==4.48.0",
-    "verovio==4.3.1",
+inference_image = (
+    modal.Image.debian_slim(python_version="3.12")
+    .apt_install("git")
+    .pip_install(
+        "torch==2.5.1",
+        "torchvision==0.20.1",
+        "numpy>=1.21.6,<2.0.0",
+        "pydantic>=2.7.2",
+        "PyMuPDF>=1.24.9,<=1.24.14",
+        "pdfminer.six==20231228",
+        "pycocotools>=2.0.6",
+        "transformers==4.52.4",
+        "qwen_vl_utils==0.0.10",
+        "matplotlib",
+        "doclayout_yolo==0.0.2b1",
+        "PyYAML",
+        "dill>=0.3.8,<1",
+        "pdf2image==1.17.0",
+        "openai==1.88.0",
+        "fastapi>=0.104.1",
+        "uvicorn[standard]>=0.24.0",
+        "Pillow",
+        "paddlex",
+        "pypdfium2",
+        "opencv-contrib-python",
+        "git+https://github.com/Yuliang-Liu/MonkeyOCR.git"
+    )
+    .add_local_dir("tools", "/root/tools", copy=True)
+    .run_commands([
+        "python -m pip install huggingface_hub",
+        "python /root/tools/download_model.py -n MonkeyOCR-pro-1.2B"
+    ])
+    .add_local_file("model_configs.yaml", "/root/model_configs.yaml")
 )
-
-# ## Cache the pre-trained model on a Modal Volume
-
-# We can obtain the pre-trained model we want to run from Hugging Face
-# using its name and a revision identifier.
-
-MODEL_NAME = "ucaslcl/GOT-OCR2_0"
-MODEL_REVISION = "cf6b7386bc89a54f09785612ba74cb12de6fa17c"
-
-# The logic for loading the model based on this information
-# is encapsulated in the `setup` function below.
-
-
-def setup():
-    import warnings
-
-    from transformers import AutoModel, AutoTokenizer
-
-    with warnings.catch_warnings():  # filter noisy warnings from GOT modeling code
-        warnings.simplefilter("ignore")
-        tokenizer = AutoTokenizer.from_pretrained(
-            MODEL_NAME, revision=MODEL_REVISION, trust_remote_code=True
-        )
-
-        model = AutoModel.from_pretrained(
-            MODEL_NAME,
-            revision=MODEL_REVISION,
-            trust_remote_code=True,
-            device_map="cuda",
-            use_safetensors=True,
-            pad_token_id=tokenizer.eos_token_id,
-        )
-
-    return tokenizer, model
-
-
-# The `.from_pretrained` methods from Hugging Face are smart enough
-# to only download models if they haven't been downloaded before.
-# But in Modal's serverless environment, filesystems are ephemeral,
-# and so using this code alone would mean that models need to get downloaded
-# on every request.
-
-# So instead, we create a Modal [Volume](https://modal.com/docs/guide/volumes)
-# to store the model -- a durable filesystem that any Modal Function can access.
-
-model_cache = modal.Volume.from_name("hf-hub-cache", create_if_missing=True)
-
-# We also update the environment variables for our Function
-# to include this new path for the model cache --
-# and to enable fast downloads with the `hf_transfer` library.
-
-MODEL_CACHE_PATH = "/root/models"
-inference_image = inference_image.env(
-    {"HF_HUB_CACHE": MODEL_CACHE_PATH, "HF_HUB_ENABLE_HF_TRANSFER": "1"}
-)
-
 
 # ## Run OCR inference on Modal by wrapping with `app.function`
 
@@ -115,23 +83,33 @@ inference_image = inference_image.env(
 # and have access to our [shared model cache](https://modal.com/docs/guide/volumes).
 
 
+# 直接用 monkeyocr 推理
 @app.function(
     gpu="l40s",
     retries=3,
-    volumes={MODEL_CACHE_PATH: model_cache},
     image=inference_image,
 )
 def parse_receipt(image: bytes) -> str:
     from tempfile import NamedTemporaryFile
+    from magic_pdf.model.custom_model import MonkeyOCR
+    from PIL import Image
+    from importlib.util import find_spec
 
-    tokenizer, model = setup()
+    config_path = "/root/model_configs.yaml"
+    model = MonkeyOCR(config_path)
 
+    # 将 image bytes 保存为临时图片
     with NamedTemporaryFile(delete=False, mode="wb+") as temp_img_file:
         temp_img_file.write(image)
-        output = model.chat(tokenizer, temp_img_file.name, ocr_type="format")
+        temp_img_file.flush()
+        temp_img_file.seek(0)
+        img = Image.open(temp_img_file.name)
+        # 这里假设 monkeyocr 有 chat_model.batch_inference 方法，参考 parse.py
+        instruction = "Please output the text content from the image."
+        result = model.chat_model.batch_inference([img], [instruction])
+        output = result[0] if result else ""
 
     print("Result: ", output)
-
     return output
 
 
