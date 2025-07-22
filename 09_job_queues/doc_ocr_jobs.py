@@ -36,7 +36,39 @@ app = modal.App("example-doc-ocr-jobs")
 
 inference_image = (
     modal.Image.debian_slim(python_version="3.12")
-    .apt_install("git")
+    .apt_install(
+        "git",
+        "libgl1-mesa-glx",
+        "libglib2.0-0",
+        "libsm6",
+        "libxext6",
+        "libxrender-dev",
+        "libgomp1",
+        "libgcc-s1",
+        "ffmpeg",
+        "libfontconfig1",
+        "libxrender1",
+        "libgl1-mesa-dev",
+        "libgstreamer1.0-0",
+        "libgstreamer-plugins-base1.0-0",
+        "libgtk-3-0",
+        "libavcodec-dev",
+        "libavformat-dev",
+        "libswscale-dev",
+        "libv4l-dev",
+        "libxvidcore-dev",
+        "libx264-dev",
+        "libjpeg-dev",
+        "libpng-dev",
+        "libtiff-dev",
+        "libatlas-base-dev",
+        "gfortran",
+        "wget",
+        "unzip",
+        "pkg-config",
+        "libcairo2-dev",
+        "libgirepository1.0-dev"
+    )
     .pip_install(
         "torch==2.5.1",
         "torchvision==0.20.1",
@@ -56,9 +88,10 @@ inference_image = (
         "fastapi>=0.104.1",
         "uvicorn[standard]>=0.24.0",
         "Pillow",
-        "paddlex",
         "pypdfium2",
-        "opencv-contrib-python",
+        "opencv-contrib-python",  # 恢复使用完整版本的OpenCV
+        "paddlepaddle-gpu",  # 添加 PaddlePaddle GPU 版本
+        "paddlex",
         "git+https://github.com/Yuliang-Liu/MonkeyOCR.git"
     )
     .add_local_dir("tools", "/root/tools", copy=True)
@@ -90,20 +123,26 @@ inference_image = (
     image=inference_image,
 )
 def parse_receipt(image: bytes) -> str:
-    from tempfile import NamedTemporaryFile
+    import os
+    import tempfile
     from magic_pdf.model.custom_model import MonkeyOCR
     from PIL import Image
-    from importlib.util import find_spec
+    
+    # 设置环境变量以避免显示相关问题
+    os.environ['DISPLAY'] = ':99'
+    os.environ['QT_QPA_PLATFORM'] = 'offscreen'
 
     config_path = "/root/model_configs.yaml"
     model = MonkeyOCR(config_path)
 
     # 将 image bytes 保存为临时图片
-    with NamedTemporaryFile(delete=False, mode="wb+") as temp_img_file:
+    with tempfile.NamedTemporaryFile(delete=False, suffix='.png') as temp_img_file:
         temp_img_file.write(image)
         temp_img_file.flush()
-        temp_img_file.seek(0)
+        
+        # 使用PIL打开图片
         img = Image.open(temp_img_file.name)
+        
         # 这里假设 monkeyocr 有 chat_model.batch_inference 方法，参考 parse.py
         instruction = "Please output the text content from the image."
         result = model.chat_model.batch_inference([img], [instruction])
