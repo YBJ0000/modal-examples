@@ -35,7 +35,7 @@ app = modal.App("example-doc-ocr-jobs")
 # [Image](https://modal.com/docs/guide/images).
 
 inference_image = (
-    modal.Image.debian_slim(python_version="3.12")
+    modal.Image.debian_slim(python_version="3.10")  # 从3.12降级到3.10
     .apt_install(
         "git",
         "libgl1-mesa-glx",
@@ -90,14 +90,18 @@ inference_image = (
         "Pillow",
         "pypdfium2",
         "opencv-contrib-python",  # 恢复使用完整版本的OpenCV
-        "paddlepaddle-gpu",  # 添加 PaddlePaddle GPU 版本
+        "paddlepaddle-gpu==2.6.2",  # 使用兼容Python 3.12的版本
         "paddlex",
         "git+https://github.com/Yuliang-Liu/MonkeyOCR.git"
     )
     .add_local_dir("tools", "/root/tools", copy=True)
+    .add_local_dir("patches", "/root/patches", copy=True)  # 添加补丁文件夹
     .run_commands([
         "python -m pip install huggingface_hub",
-        "python /root/tools/download_model.py -n MonkeyOCR-pro-1.2B"
+        "python /root/tools/download_model.py -n MonkeyOCR-pro-1.2B",
+        # 创建自动加载补丁的文件
+        "echo 'import sys; sys.path.insert(0, \"/root/patches\")' > /usr/local/lib/python3.10/site-packages/paddle_patch.pth",
+        "echo 'import monkey_patch' >> /usr/local/lib/python3.10/site-packages/paddle_patch.pth"
     ])
     .add_local_file("model_configs.yaml", "/root/model_configs.yaml")
 )
