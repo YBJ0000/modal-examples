@@ -90,14 +90,18 @@ inference_image = (
         "Pillow",
         "pypdfium2",
         "opencv-contrib-python",  # 恢复使用完整版本的OpenCV
-        "paddlepaddle-gpu==2.6.2",  # 使用兼容Python 3.12的版本
-        "paddlex",
-        "git+https://github.com/Yuliang-Liu/MonkeyOCR.git"
+        "paddlepaddle-gpu==2.6.2",  # 使用可用的最高版本2.6.2
+        "paddlex[base]",  # 使用base版本的paddlex
+        "git+https://github.com/Yuliang-Liu/MonkeyOCR.git",
+        "huggingface_hub"  # 直接在pip_install中添加huggingface_hub
     )
-    .add_local_dir("tools", "/root/tools", copy=True)
+    .add_local_dir("tools", "/root/tools", copy=True)  # 确保这行正确添加tools目录
     .add_local_dir("patches", "/root/patches", copy=True)  # 添加补丁文件夹
     .run_commands([
-        "python -m pip install huggingface_hub",
+        # 移除这行，因为我们已经在pip_install中添加了huggingface_hub
+        # "python -m pip install huggingface_hub",
+        # 确保下载模型的命令正确
+        "ls -la /root/tools",  # 添加调试命令，检查tools目录是否存在
         "python /root/tools/download_model.py -n MonkeyOCR-pro-1.2B",
         # 创建自动加载补丁的文件
         "echo 'import sys; sys.path.insert(0, \"/root/patches\")' > /usr/local/lib/python3.10/site-packages/paddle_patch.pth",
