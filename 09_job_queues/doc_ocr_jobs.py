@@ -3,7 +3,7 @@
 # mypy: ignore-errors
 # ---
 
-# # Run a job queue for GOT-OCR
+# # Run a job queue for olmOCR
 
 # This tutorial shows you how to use Modal as an infinitely scalable job queue
 # that can service async tasks from a web app. For the purpose of this tutorial,
@@ -12,13 +12,9 @@
 # to use this pattern. You can submit async tasks to Modal from any Python
 # application (for example, a regular Django app running on Kubernetes).
 
-# Our job queue will handle a single task: running OCR transcription for images of receipts.
-# We'll make use of a pre-trained model:
-# the [General OCR Theory (GOT) 2.0 model](https://huggingface.co/stepfun-ai/GOT-OCR2_0).
-
-# Try it out for yourself [here](https://modal-labs-examples--example-doc-ocr-webapp-wrapper.modal.run/).
-
-# [![Webapp frontend](https://modal-cdn.com/doc_ocr_frontend.jpg)](https://modal-labs-examples--example-doc-ocr-webapp-wrapper.modal.run/)
+# Our job queue will handle a single task: running OCR transcription for images of receipts and documents.
+# We'll make use of olmOCR: a toolkit for converting PDFs and other image-based document formats 
+# into clean, readable, plain text format using a 7B parameter Vision Language Model.
 
 # ## Define an App
 
@@ -29,110 +25,141 @@ from typing import Optional
 
 import modal
 
-app = modal.App("example-doc-ocr-jobs")
+app = modal.App("example-olmocr-jobs")
 
-# We also define the dependencies for our Function by specifying an
+# We define the dependencies for our Function by specifying an
 # [Image](https://modal.com/docs/guide/images).
+# olmOCR requires specific dependencies including poppler-utils for PDF processing.
 
-inference_image = modal.Image.debian_slim(python_version="3.12").pip_install(
-    "accelerate==0.28.0",
-    "huggingface_hub[hf_transfer]==0.27.1",
-    "numpy<2",
-    "tiktoken==0.6.0",
-    "torch==2.5.1",
-    "torchvision==0.20.1",
-    "transformers==4.48.0",
-    "verovio==4.3.1",
+inference_image = (
+    modal.Image.debian_slim(python_version="3.11")
+    .apt_install(
+        "poppler-utils",
+        "curl",
+        "fonts-liberation",
+        "fonts-dejavu-core",
+        "fontconfig"
+    )
+    # Install PyTorch with CUDA support first
+    .pip_install(
+        "torch==2.5.1",
+        "torchvision==0.20.1",
+        index_url="https://download.pytorch.org/whl/cu121"
+    )
+    # Install other dependencies from PyPI
+    .pip_install(
+        "accelerate==0.28.0",
+        "huggingface_hub[hf_transfer]==0.27.1",
+        "transformers==4.48.0",
+        "numpy<2",
+        "safetensors",
+        "Pillow"
+    )
+    # Install olmOCR
+    .pip_install("olmocr[gpu]")
 )
 
 # ## Cache the pre-trained model on a Modal Volume
 
-# We can obtain the pre-trained model we want to run from Hugging Face
-# using its name and a revision identifier.
+# olmOCR uses models that are downloaded and cached automatically.
+# We create a Modal [Volume](https://modal.com/docs/guide/volumes) to store the model cache
+# to avoid re-downloading on every request.
 
-MODEL_NAME = "ucaslcl/GOT-OCR2_0"
-MODEL_REVISION = "cf6b7386bc89a54f09785612ba74cb12de6fa17c"
+model_cache = modal.Volume.from_name("olmocr-cache", create_if_missing=True)
 
-# The logic for loading the model based on this information
-# is encapsulated in the `setup` function below.
-
-
-def setup():
-    import warnings
-
-    from transformers import AutoModel, AutoTokenizer
-
-    with warnings.catch_warnings():  # filter noisy warnings from GOT modeling code
-        warnings.simplefilter("ignore")
-        tokenizer = AutoTokenizer.from_pretrained(
-            MODEL_NAME, revision=MODEL_REVISION, trust_remote_code=True
-        )
-
-        model = AutoModel.from_pretrained(
-            MODEL_NAME,
-            revision=MODEL_REVISION,
-            trust_remote_code=True,
-            device_map="cuda",
-            use_safetensors=True,
-            pad_token_id=tokenizer.eos_token_id,
-        )
-
-    return tokenizer, model
-
-
-# The `.from_pretrained` methods from Hugging Face are smart enough
-# to only download models if they haven't been downloaded before.
-# But in Modal's serverless environment, filesystems are ephemeral,
-# and so using this code alone would mean that models need to get downloaded
-# on every request.
-
-# So instead, we create a Modal [Volume](https://modal.com/docs/guide/volumes)
-# to store the model -- a durable filesystem that any Modal Function can access.
-
-model_cache = modal.Volume.from_name("hf-hub-cache", create_if_missing=True)
-
-# We also update the environment variables for our Function
-# to include this new path for the model cache --
-# and to enable fast downloads with the `hf_transfer` library.
-
-MODEL_CACHE_PATH = "/root/models"
-inference_image = inference_image.env(
-    {"HF_HUB_CACHE": MODEL_CACHE_PATH, "HF_HUB_ENABLE_HF_TRANSFER": "1"}
-)
-
+# Use a dedicated path for the model cache that won't conflict with existing directories
+MODEL_CACHE_PATH = "/root/model_cache"
+inference_image = inference_image.env({
+    "HF_HOME": MODEL_CACHE_PATH,
+    "TRANSFORMERS_CACHE": MODEL_CACHE_PATH,
+    "HF_HUB_CACHE": MODEL_CACHE_PATH,
+    "HF_HUB_ENABLE_HF_TRANSFER": "1"
+})
 
 # ## Run OCR inference on Modal by wrapping with `app.function`
-
-# Now let's set up the actual OCR inference.
 
 # Using the [`@app.function`](https://modal.com/docs/reference/modal.App#function)
 # decorator, we set up a Modal [Function](https://modal.com/docs/reference/modal.Function).
 # We provide arguments to that decorator to customize the hardware, scaling, and other features
 # of the Function.
 
-# Here, we say that this Function should use NVIDIA L40S [GPUs](https://modal.com/docs/guide/gpu),
-# automatically [retry](https://modal.com/docs/guide/retries#function-retries) failures up to 3 times,
-# and have access to our [shared model cache](https://modal.com/docs/guide/volumes).
+# olmOCR requires a GPU with at least 20GB of GPU RAM. We use A100 which has 40GB.
 
 
 @app.function(
-    gpu="l40s",
+    gpu="a100",
     retries=3,
     volumes={MODEL_CACHE_PATH: model_cache},
     image=inference_image,
+    timeout=600,  # 10 minutes timeout for processing
 )
 def parse_receipt(image: bytes) -> str:
-    from tempfile import NamedTemporaryFile
-
-    tokenizer, model = setup()
-
-    with NamedTemporaryFile(delete=False, mode="wb+") as temp_img_file:
-        temp_img_file.write(image)
-        output = model.chat(tokenizer, temp_img_file.name, ocr_type="format")
-
-    print("Result: ", output)
-
-    return output
+    import tempfile
+    import subprocess
+    import os
+    from pathlib import Path
+    
+    # Create a temporary workspace directory
+    with tempfile.TemporaryDirectory() as temp_dir:
+        workspace_dir = Path(temp_dir) / "workspace"
+        workspace_dir.mkdir(exist_ok=True)
+        
+        # Save the input image to a temporary file
+        if image.startswith(b'\x89PNG') or image.startswith(b'\xff\xd8\xff'):
+            # PNG or JPEG image
+            image_path = workspace_dir / "input_image.png"
+            with open(image_path, "wb") as f:
+                f.write(image)
+        else:
+            # Assume PDF
+            image_path = workspace_dir / "input_document.pdf" 
+            with open(image_path, "wb") as f:
+                f.write(image)
+        
+        # Run olmOCR pipeline
+        try:
+            cmd = [
+                "python", "-m", "olmocr.pipeline", 
+                str(workspace_dir),
+                "--markdown",
+                "--pdfs", str(image_path)
+            ]
+            
+            result = subprocess.run(
+                cmd,
+                capture_output=True,
+                text=True,
+                check=True,
+                cwd=temp_dir
+            )
+            
+            print(f"olmOCR command output: {result.stdout}")
+            if result.stderr:
+                print(f"olmOCR stderr: {result.stderr}")
+            
+            # Read the markdown output
+            markdown_dir = workspace_dir / "markdown"
+            if markdown_dir.exists():
+                markdown_files = list(markdown_dir.glob("*.md"))
+                if markdown_files:
+                    output_file = markdown_files[0]
+                    with open(output_file, "r", encoding="utf-8") as f:
+                        output = f.read()
+                    print(f"Result: {output[:500]}...")  # Print first 500 chars
+                    return output
+                else:
+                    return "No markdown output generated"
+            else:
+                return "Markdown output directory not found"
+                
+        except subprocess.CalledProcessError as e:
+            error_msg = f"olmOCR failed: {e.stderr}"
+            print(error_msg)
+            return error_msg
+        except Exception as e:
+            error_msg = f"Unexpected error: {str(e)}"
+            print(error_msg)
+            return error_msg
 
 
 # ## Deploy
@@ -147,25 +174,20 @@ def parse_receipt(image: bytes) -> str:
 # from another Python process and submit tasks to it:
 
 # ```python
-# fn = modal.Function.from_name("example-doc-ocr-jobs", "parse_receipt")
+# fn = modal.Function.from_name("example-olmocr-jobs", "parse_receipt")
 # fn.spawn(my_image)
 # ```
 
 # Modal will auto-scale to handle all the tasks queued, and
-# then scale back down to 0 when there's no work left. To see how you could use this from a Python web
-# app, take a look at the [receipt parser frontend](https://modal.com/docs/examples/doc_ocr_webapp)
-# tutorial.
+# then scale back down to 0 when there's no work left.
 
 # ## Run manually
 
 # We can also trigger `parse_receipt` manually for easier debugging:
 
 # ```shell
-# modal run doc_ocr_jobs
+# modal run doc_ocr_jobs.py
 # ```
-
-# To try it out, you can find some
-# example receipts [here](https://drive.google.com/drive/folders/1S2D1gXd4YIft4a5wDtW99jfl38e85ouW).
 
 
 @app.local_entrypoint()
@@ -180,11 +202,17 @@ def main(receipt_filename: Optional[str] = None):
 
     if receipt_filename.exists():
         image = receipt_filename.read_bytes()
-        print(f"running OCR on {receipt_filename}")
+        print(f"running olmOCR on {receipt_filename}")
     else:
-        receipt_url = "https://modal-cdn.com/cdnbot/Brandys-walmart-receipt-8g68_a_hk_f9c25fce.webp"
+        # Use a sample PDF for testing
+        receipt_url = "https://olmocr.allenai.org/papers/olmocr_3pg_sample.pdf"
         request = urllib.request.Request(receipt_url)
         with urllib.request.urlopen(request) as response:
             image = response.read()
-        print(f"running OCR on sample from URL {receipt_url}")
-    print(parse_receipt.remote(image))
+        print(f"running olmOCR on sample PDF from URL {receipt_url}")
+    
+    result = parse_receipt.remote(image)
+    print("=" * 50)
+    print("OCR Result:")
+    print("=" * 50)
+    print(result)
