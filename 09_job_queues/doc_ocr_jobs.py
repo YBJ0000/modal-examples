@@ -116,13 +116,13 @@ def parse_receipt(image: bytes) -> str:
             with open(image_path, "wb") as f:
                 f.write(image)
         
-        # Run olmOCR pipeline
+        # Run olmOCR pipeline with correct parameters
         try:
             cmd = [
                 "python", "-m", "olmocr.pipeline", 
-                str(workspace_dir),
-                "--markdown",
-                "--pdfs", str(image_path)
+                str(workspace_dir),  # workspace directory first
+                "--markdown",        # enable markdown output
+                "--pdfs", str(image_path)  # then specify the PDF/image file
             ]
             
             result = subprocess.run(
@@ -137,20 +137,38 @@ def parse_receipt(image: bytes) -> str:
             if result.stderr:
                 print(f"olmOCR stderr: {result.stderr}")
             
-            # Read the markdown output
+            # Read the markdown output - check both possible locations
             markdown_dir = workspace_dir / "markdown"
+            results_dir = workspace_dir / "results"
+            
+            # Try markdown directory first
             if markdown_dir.exists():
                 markdown_files = list(markdown_dir.glob("*.md"))
                 if markdown_files:
                     output_file = markdown_files[0]
                     with open(output_file, "r", encoding="utf-8") as f:
                         output = f.read()
-                    print(f"Result: {output[:500]}...")  # Print first 500 chars
+                    print(f"Found markdown result: {output[:500]}...")
                     return output
-                else:
-                    return "No markdown output generated"
-            else:
-                return "Markdown output directory not found"
+            
+            # Try results directory for JSONL files
+            if results_dir.exists():
+                jsonl_files = list(results_dir.glob("*.jsonl"))
+                if jsonl_files:
+                    import json
+                    output_file = jsonl_files[0]
+                    with open(output_file, "r", encoding="utf-8") as f:
+                        for line in f:
+                            data = json.loads(line)
+                            if 'text' in data:
+                                print(f"Found JSONL result: {data['text'][:500]}...")
+                                return data['text']
+            
+            # If no output found, return debug info
+            workspace_contents = list(workspace_dir.rglob("*"))
+            debug_info = f"Workspace contents: {[str(p.relative_to(workspace_dir)) for p in workspace_contents]}"
+            print(debug_info)
+            return f"No output generated. {debug_info}"
                 
         except subprocess.CalledProcessError as e:
             error_msg = f"olmOCR failed: {e.stderr}"
