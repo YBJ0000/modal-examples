@@ -25,7 +25,7 @@ from typing import Optional
 
 import modal
 
-app = modal.App("example-olmocr-jobs")
+app = modal.App("example-doc-ocr-jobs")  # 改为与 GOT-OCR 版本相同的名称
 
 # We define the dependencies for our Function by specifying an
 # [Image](https://modal.com/docs/guide/images).
