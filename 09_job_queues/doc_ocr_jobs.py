@@ -134,17 +134,17 @@ def parse_receipt(image: bytes) -> str:
                 with open(pdf_path, "wb") as f:
                     f.write(image)
                 
-                # Render PDF page to base64 image
+                # Render PDF page to base64 image (fixed parameter order)
                 image_base64 = render_pdf_to_base64png(
                     str(pdf_path), 
-                    page_num=1, 
+                    1,  # page number as positional argument
                     target_longest_image_dim=1024
                 )
                 
-                # Get anchor text for document metadata
+                # Get anchor text for document metadata (fixed parameter order)
                 anchor_text = get_anchor_text(
                     str(pdf_path), 
-                    page_num=1, 
+                    1,  # page number as positional argument
                     pdf_engine="pdfreport", 
                     target_length=4000
                 )
