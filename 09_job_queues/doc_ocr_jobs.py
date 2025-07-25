@@ -109,23 +109,33 @@ def parse_receipt(image: bytes) -> str:
     from olmocr.prompts import build_finetuning_prompt
     from olmocr.prompts.anchor import get_anchor_text
     
+    # 新增：设置PyTorch优化选项
+    torch.backends.cudnn.benchmark = True
+    torch.backends.cuda.matmul.allow_tf32 = True
+    
     # Load model and processor (will be cached by Modal)
     print("Loading olmOCR model and processor...")
     
-    # Optimized model loading with better memory management (removed flash_attention_2)
-    model = Qwen2VLForConditionalGeneration.from_pretrained(
-        "allenai/olmOCR-7B-0225-preview", 
-        torch_dtype=torch.bfloat16,
-        device_map="auto",  # Automatic device placement
-        low_cpu_mem_usage=True  # Reduce CPU memory usage during loading
-    ).eval()
+    # Optimized model loading with better memory management
+    with torch.device("cuda"):
+        model = Qwen2VLForConditionalGeneration.from_pretrained(
+            "allenai/olmOCR-7B-0225-preview", 
+            torch_dtype=torch.bfloat16,
+            device_map="auto",
+            low_cpu_mem_usage=True,
+            use_safetensors=True,
+        ).eval()
+    
+    # 新增：使用torch.compile优化模型推理
+    print("Compiling model with torch.compile for faster inference...")
+    model = torch.compile(model, mode="reduce-overhead")
     
     processor = AutoProcessor.from_pretrained("Qwen/Qwen2-VL-7B-Instruct")
     
     # Move model to GPU
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     
-    print(f"Model loaded successfully on {device}")
+    print(f"Model loaded and compiled successfully on {device}")
     
     try:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -154,19 +164,25 @@ def parse_receipt(image: bytes) -> str:
                 )
                 
             elif image.startswith(b'\x89PNG') or image.startswith(b'\xff\xd8\xff'):
-                # PNG or JPEG image
+                # PNG or JPEG image - 优化图像处理
                 pil_image = Image.open(BytesIO(image))
                 
+                # 新增：如果是JPEG，使用更快的解码方式
+                if image.startswith(b'\xff\xd8\xff'):
+                    if pil_image.mode != 'RGB':
+                        pil_image = pil_image.convert('RGB')
+                
                 # Optimize image size for faster processing
-                max_size = 896  # Consistent with PDF processing
+                max_size = 896
                 if max(pil_image.size) > max_size:
                     ratio = max_size / max(pil_image.size)
                     new_size = tuple(int(dim * ratio) for dim in pil_image.size)
-                    pil_image = pil_image.resize(new_size, Image.Resampling.LANCZOS)
+                    # 新增：使用更快的重采样方法
+                    pil_image = pil_image.resize(new_size, Image.Resampling.BILINEAR)
                 
-                # Convert to base64
+                # Convert to base64 - 优化压缩
                 buffered = BytesIO()
-                pil_image.save(buffered, format="PNG")
+                pil_image.save(buffered, format="PNG", optimize=True)
                 image_base64 = base64.b64encode(buffered.getvalue()).decode()
                 
                 # For images, use minimal anchor text
@@ -199,27 +215,29 @@ def parse_receipt(image: bytes) -> str:
             # Decode base64 image for processing
             main_image = Image.open(BytesIO(base64.b64decode(image_base64)))
             
-            # Process inputs
+            # Process inputs - 优化输入处理
             inputs = processor(
                 text=[text],
                 images=[main_image],
                 padding=True,
                 return_tensors="pt",
+                max_length=2048,
+                truncation=True,
             )
-            inputs = {key: value.to(device) for (key, value) in inputs.items()}
+            inputs = {key: value.to(device, non_blocking=True) for (key, value) in inputs.items()}
             
             print("Running olmOCR inference...")
             
-            # Optimized generation parameters for speed
-            with torch.no_grad():
+            # 优化：使用torch.inference_mode()替代torch.no_grad()
+            with torch.inference_mode():
                 output = model.generate(
                     **inputs,
-                    temperature=0.3,  # Reduced from 0.8 for faster, more deterministic generation
-                    max_new_tokens=1536,  # Reduced from 2048 for faster generation
+                    temperature=0.3,
+                    max_new_tokens=1536,
                     num_return_sequences=1,
-                    do_sample=False,  # Greedy decoding for speed (changed from True)
-                    pad_token_id=processor.tokenizer.eos_token_id,  # Explicit pad token
-                    use_cache=True,  # Enable KV caching for faster generation
+                    do_sample=False,
+                    pad_token_id=processor.tokenizer.eos_token_id,
+                    use_cache=True,
                 )
             
             # Decode the output
