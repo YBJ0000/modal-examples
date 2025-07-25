@@ -54,8 +54,10 @@ inference_image = (
         "safetensors",
         "Pillow"
     )
-    # Install olmOCR
-    .pip_install("olmocr[gpu]")
+    # Install latest olmOCR with GPU support and flash infer for faster inference
+    .pip_install("olmocr[gpu]>=0.2.1")
+    # Install flash infer for faster GPU inference (recommended by olmOCR)
+    .pip_install("https://download.pytorch.org/whl/cu128/flashinfer/flashinfer_python-0.2.5%2Bcu128torch2.7-cp38-abi3-linux_x86_64.whl")
 )
 
 # ## Cache the pre-trained model on a Modal Volume
