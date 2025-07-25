@@ -112,16 +112,18 @@ def parse_receipt(image: bytes) -> str:
     # Load model and processor (will be cached by Modal)
     print("Loading olmOCR model and processor...")
     
+    # Optimized model loading with better memory management (removed flash_attention_2)
     model = Qwen2VLForConditionalGeneration.from_pretrained(
         "allenai/olmOCR-7B-0225-preview", 
-        torch_dtype=torch.bfloat16
+        torch_dtype=torch.bfloat16,
+        device_map="auto",  # Automatic device placement
+        low_cpu_mem_usage=True  # Reduce CPU memory usage during loading
     ).eval()
     
     processor = AutoProcessor.from_pretrained("Qwen/Qwen2-VL-7B-Instruct")
     
     # Move model to GPU
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    model.to(device)
     
     print(f"Model loaded successfully on {device}")
     
@@ -136,24 +138,31 @@ def parse_receipt(image: bytes) -> str:
                 with open(pdf_path, "wb") as f:
                     f.write(image)
                 
-                # Render PDF page to base64 image (fixed parameter order)
+                # Optimized image rendering - reduce resolution for faster processing
                 image_base64 = render_pdf_to_base64png(
                     str(pdf_path), 
                     1,  # page number as positional argument
-                    target_longest_image_dim=1024
+                    target_longest_image_dim=896  # Reduced from 1024 for faster processing
                 )
                 
-                # Get anchor text for document metadata (fixed parameter order)
+                # Optimized anchor text - reduce length for faster processing
                 anchor_text = get_anchor_text(
                     str(pdf_path), 
                     1,  # page number as positional argument
                     pdf_engine="pdfreport", 
-                    target_length=4000
+                    target_length=2048  # Reduced from 4000 for faster processing
                 )
                 
             elif image.startswith(b'\x89PNG') or image.startswith(b'\xff\xd8\xff'):
                 # PNG or JPEG image
                 pil_image = Image.open(BytesIO(image))
+                
+                # Optimize image size for faster processing
+                max_size = 896  # Consistent with PDF processing
+                if max(pil_image.size) > max_size:
+                    ratio = max_size / max(pil_image.size)
+                    new_size = tuple(int(dim * ratio) for dim in pil_image.size)
+                    pil_image = pil_image.resize(new_size, Image.Resampling.LANCZOS)
                 
                 # Convert to base64
                 buffered = BytesIO()
@@ -201,14 +210,16 @@ def parse_receipt(image: bytes) -> str:
             
             print("Running olmOCR inference...")
             
-            # Generate output using the model
+            # Optimized generation parameters for speed
             with torch.no_grad():
                 output = model.generate(
                     **inputs,
-                    temperature=0.8,
-                    max_new_tokens=2048,  # Increased for longer documents
+                    temperature=0.3,  # Reduced from 0.8 for faster, more deterministic generation
+                    max_new_tokens=1536,  # Reduced from 2048 for faster generation
                     num_return_sequences=1,
-                    do_sample=True,
+                    do_sample=False,  # Greedy decoding for speed (changed from True)
+                    pad_token_id=processor.tokenizer.eos_token_id,  # Explicit pad token
+                    use_cache=True,  # Enable KV caching for faster generation
                 )
             
             # Decode the output
