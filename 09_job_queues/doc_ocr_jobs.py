@@ -117,7 +117,7 @@ def parse_receipt(image: bytes) -> str:
         torch_dtype=torch.bfloat16
     ).eval()
     
-    processor = AutoProcessor.from_pretrained("Qwen/Qwen2-VL-7B-Instruct")
+    processor = AutoProcessor.from_pretrained("Qwen/Qwen2-VL-7B-Instruct", use_fast=True)
     
     # Move model to GPU
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -208,7 +208,7 @@ def parse_receipt(image: bytes) -> str:
                     temperature=0.8,
                     max_new_tokens=2048,  # Increased for longer documents
                     num_return_sequences=1,
-                    do_sample=True,
+                    do_sample=False,
                 )
             
             # Decode the output
