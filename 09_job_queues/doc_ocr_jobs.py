@@ -90,6 +90,9 @@ inference_image = inference_image.env({
     volumes={MODEL_CACHE_PATH: model_cache},
     image=inference_image,
     timeout=600,  # 10 minutes timeout for processing
+    # 添加性能优化参数
+    keep_warm=1,  # 保持一个实例热启动
+    container_idle_timeout=300,  # 5分钟空闲超时
 )
 def parse_receipt(image: bytes) -> str:
     """
@@ -109,19 +112,42 @@ def parse_receipt(image: bytes) -> str:
     from olmocr.prompts import build_finetuning_prompt
     from olmocr.prompts.anchor import get_anchor_text
     
+    # 设置PyTorch性能优化
+    torch.backends.cudnn.benchmark = True
+    torch.backends.cudnn.deterministic = False
+    torch.set_float32_matmul_precision('high')  # 使用TensorFloat-32精度
+    
     # Load model and processor (will be cached by Modal)
     print("Loading olmOCR model and processor...")
     
+    # 优化模型加载参数
     model = Qwen2VLForConditionalGeneration.from_pretrained(
         "allenai/olmOCR-7B-0225-preview", 
-        torch_dtype=torch.bfloat16
+        torch_dtype=torch.bfloat16,
+        device_map="auto",  # 自动设备映射
+        low_cpu_mem_usage=True,  # 降低CPU内存使用
+        trust_remote_code=True,
+        # 移除 flash_attention_2，使用默认的注意力实现
+        # attn_implementation="flash_attention_2"  # 使用Flash Attention 2（如果可用）
     ).eval()
     
-    processor = AutoProcessor.from_pretrained("Qwen/Qwen2-VL-7B-Instruct", use_fast=True)
+    processor = AutoProcessor.from_pretrained(
+        "Qwen/Qwen2-VL-7B-Instruct", 
+        use_fast=True,
+        trust_remote_code=True
+    )
     
     # Move model to GPU
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    model.to(device)
+    if not hasattr(model, 'device') or model.device != device:
+        model.to(device)
+    
+    # 编译模型以提升推理速度（PyTorch 2.0+）
+    try:
+        model = torch.compile(model, mode="reduce-overhead")
+        print("Model compiled successfully for faster inference")
+    except Exception as e:
+        print(f"Model compilation failed, continuing without compilation: {e}")
     
     print(f"Model loaded successfully on {device}")
     
@@ -190,25 +216,27 @@ def parse_receipt(image: bytes) -> str:
             # Decode base64 image for processing
             main_image = Image.open(BytesIO(base64.b64decode(image_base64)))
             
-            # Process inputs
+            # Process inputs with optimization
             inputs = processor(
                 text=[text],
                 images=[main_image],
                 padding=True,
                 return_tensors="pt",
             )
-            inputs = {key: value.to(device) for (key, value) in inputs.items()}
+            inputs = {key: value.to(device, non_blocking=True) for (key, value) in inputs.items()}
             
             print("Running olmOCR inference...")
             
-            # Generate output using the model
-            with torch.no_grad():
+            # Generate output using the model with optimized parameters
+            with torch.no_grad(), torch.cuda.amp.autocast(dtype=torch.bfloat16):
                 output = model.generate(
                     **inputs,
                     temperature=0.8,
                     max_new_tokens=2048,  # Increased for longer documents
                     num_return_sequences=1,
                     do_sample=False,
+                    use_cache=True,  # 启用KV缓存
+                    pad_token_id=processor.tokenizer.eos_token_id,
                 )
             
             # Decode the output
