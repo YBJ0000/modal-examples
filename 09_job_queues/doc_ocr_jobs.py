@@ -228,16 +228,27 @@ def parse_receipt(image: bytes) -> str:
             print("Running olmOCR inference...")
             
             # Generate output using the model with optimized parameters
-            with torch.no_grad(), torch.cuda.amp.autocast(dtype=torch.bfloat16):
-                output = model.generate(
-                    **inputs,
-                    temperature=0.8,
-                    max_new_tokens=2048,  # Increased for longer documents
-                    num_return_sequences=1,
-                    do_sample=False,
-                    use_cache=True,  # 启用KV缓存
-                    pad_token_id=processor.tokenizer.eos_token_id,
-                )
+            with torch.no_grad():
+                # 使用新的autocast API，修复FutureWarning
+                if torch.cuda.is_available():
+                    with torch.amp.autocast('cuda', dtype=torch.bfloat16):
+                        output = model.generate(
+                            **inputs,
+                            max_new_tokens=2048,  # Increased for longer documents
+                            num_return_sequences=1,
+                            do_sample=False,
+                            use_cache=True,  # 启用KV缓存
+                            pad_token_id=processor.tokenizer.eos_token_id,
+                        )
+                else:
+                    output = model.generate(
+                        **inputs,
+                        max_new_tokens=2048,
+                        num_return_sequences=1,
+                        do_sample=False,
+                        use_cache=True,
+                        pad_token_id=processor.tokenizer.eos_token_id,
+                    )
             
             # Decode the output
             prompt_length = inputs["input_ids"].shape[1]
