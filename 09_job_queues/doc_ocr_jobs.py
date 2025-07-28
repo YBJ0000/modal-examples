@@ -54,7 +54,8 @@ inference_image = (
         "transformers==4.48.0",
         "numpy<2",
         "safetensors",
-        "Pillow"
+        "Pillow",
+        "PyPDF2"  # 添加PyPDF2用于获取PDF页数
     )
     # Install vLLM for accelerated inference (支持多模态)
     .pip_install("vllm>=0.7.2")
@@ -134,7 +135,7 @@ def get_vllm_engine():
 def parse_receipt(image: bytes) -> str:
     """
     Optimized olmOCR implementation using vLLM for accelerated inference.
-    This provides significant speed improvements over the standard transformers approach.
+    This version supports multi-page PDF processing.
     """
     import tempfile
     import base64
@@ -143,6 +144,7 @@ def parse_receipt(image: bytes) -> str:
     from pathlib import Path
     from vllm import SamplingParams
     from qwen_vl_utils import process_vision_info
+    import PyPDF2
     
     # Import olmOCR modules for preprocessing
     from olmocr.data.renderpdf import render_pdf_to_base64png
@@ -160,28 +162,95 @@ def parse_receipt(image: bytes) -> str:
             
             # Determine file type and save appropriately
             if image.startswith(b'%PDF'):
-                # PDF file
+                # PDF file - process all pages
                 pdf_path = temp_path / "input.pdf"
                 with open(pdf_path, "wb") as f:
                     f.write(image)
                 
-                # Render PDF page to base64 image
-                image_base64 = render_pdf_to_base64png(
-                    str(pdf_path), 
-                    1,  # page number as positional argument
-                    target_longest_image_dim=1024
-                )
+                # Get total number of pages
+                with open(pdf_path, "rb") as pdf_file:
+                    pdf_reader = PyPDF2.PdfReader(pdf_file)
+                    total_pages = len(pdf_reader.pages)
                 
-                # Get anchor text for document metadata
-                anchor_text = get_anchor_text(
-                    str(pdf_path), 
-                    1,  # page number as positional argument
-                    pdf_engine="pdfreport", 
-                    target_length=4000
-                )
+                print(f"Processing PDF with {total_pages} pages...")
+                
+                all_results = []
+                
+                # Process each page
+                for page_num in range(1, total_pages + 1):
+                    print(f"Processing page {page_num}/{total_pages}...")
+                    
+                    try:
+                        # Render current page to base64 image
+                        image_base64 = render_pdf_to_base64png(
+                            str(pdf_path), 
+                            page_num,  # current page number
+                            target_longest_image_dim=1024
+                        )
+                        
+                        # Get anchor text for current page
+                        anchor_text = get_anchor_text(
+                            str(pdf_path), 
+                            page_num,  # current page number
+                            pdf_engine="pdfreport", 
+                            target_length=4000
+                        )
+                        
+                        # Build the prompt using olmOCR's prompt building system
+                        prompt = build_finetuning_prompt(anchor_text)
+                        
+                        # Build the multimodal message for vLLM
+                        messages = [
+                            {
+                                "role": "user",
+                                "content": [
+                                    {"type": "text", "text": prompt},
+                                    {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{image_base64}"}},
+                                ],
+                            }
+                        ]
+                        
+                        # Configure sampling parameters for OCR (deterministic output)
+                        sampling_params = SamplingParams(
+                            max_tokens=2048,  # Increased for longer documents
+                            temperature=0.0,  # Deterministic output for OCR
+                            top_p=1.0,
+                            stop=None,
+                        )
+                        
+                        # Generate output using vLLM
+                        outputs = llm.chat(
+                            messages=messages,
+                            sampling_params=sampling_params,
+                            use_tqdm=False
+                        )
+                        
+                        # Extract the generated text
+                        if outputs and len(outputs) > 0:
+                            page_result = outputs[0].outputs[0].text.strip()
+                            if page_result:
+                                all_results.append(f"# Page {page_num}\n\n{page_result}")
+                                print(f"Page {page_num} processed successfully ({len(page_result)} characters)")
+                            else:
+                                print(f"Page {page_num} returned empty result")
+                        else:
+                            print(f"Page {page_num} failed to generate output")
+                            
+                    except Exception as page_error:
+                        error_msg = f"Error processing page {page_num}: {str(page_error)}"
+                        print(error_msg)
+                        all_results.append(f"# Page {page_num}\n\n[Error processing this page: {str(page_error)}]")
+                
+                # Combine all page results
+                if all_results:
+                    final_result = "\n\n---\n\n".join(all_results)
+                    print(f"Multi-page PDF processing completed. Total output length: {len(final_result)} characters")
+                    return final_result
+                else:
+                    return "Error: No pages could be processed successfully."
                 
             elif image.startswith(b'\x89PNG') or image.startswith(b'\xff\xd8\xff'):
-                # PNG or JPEG image
+                # PNG or JPEG image - single image processing
                 pil_image = Image.open(BytesIO(image))
                 
                 # Convert to base64
@@ -192,50 +261,48 @@ def parse_receipt(image: bytes) -> str:
                 # For images, use minimal anchor text
                 anchor_text = ""
                 
+                # Build the prompt using olmOCR's prompt building system
+                prompt = build_finetuning_prompt(anchor_text)
+                
+                # Build the multimodal message for vLLM
+                messages = [
+                    {
+                        "role": "user",
+                        "content": [
+                            {"type": "text", "text": prompt},
+                            {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{image_base64}"}},
+                        ],
+                    }
+                ]
+                
+                print("Running vLLM inference on image...")
+                
+                # Configure sampling parameters for OCR (deterministic output)
+                sampling_params = SamplingParams(
+                    max_tokens=2048,  # Increased for longer documents
+                    temperature=0.0,  # Deterministic output for OCR
+                    top_p=1.0,
+                    stop=None,
+                )
+                
+                # Generate output using vLLM
+                outputs = llm.chat(
+                    messages=messages,
+                    sampling_params=sampling_params,
+                    use_tqdm=False
+                )
+                
+                # Extract the generated text
+                if outputs and len(outputs) > 0:
+                    result = outputs[0].outputs[0].text.strip()
+                else:
+                    result = "No output generated"
+                
+                print(f"Image OCR processing completed. Output length: {len(result)} characters")
+                return result
+                
             else:
                 return "Error: Unsupported file format. Please provide PDF, PNG, or JPEG files."
-            
-            # Build the prompt using olmOCR's prompt building system
-            prompt = build_finetuning_prompt(anchor_text)
-            
-            # Build the multimodal message for vLLM
-            messages = [
-                {
-                    "role": "user",
-                    "content": [
-                        {"type": "text", "text": prompt},
-                        {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{image_base64}"}},
-                    ],
-                }
-            ]
-            
-            print("Running vLLM inference...")
-            
-            # Configure sampling parameters for OCR (deterministic output)
-            sampling_params = SamplingParams(
-                max_tokens=2048,  # Increased for longer documents
-                temperature=0.0,  # Deterministic output for OCR
-                top_p=1.0,
-                stop=None,
-                # 移除无效参数，vLLM会自动处理
-            )
-            
-            # Generate output using vLLM
-            outputs = llm.chat(
-                messages=messages,
-                sampling_params=sampling_params,
-                use_tqdm=False
-            )
-            
-            # Extract the generated text
-            if outputs and len(outputs) > 0:
-                result = outputs[0].outputs[0].text.strip()
-            else:
-                result = "No output generated"
-            
-            print(f"vLLM olmOCR processing completed. Output length: {len(result)} characters")
-            
-            return result
             
     except Exception as e:
         error_msg = f"vLLM olmOCR processing failed: {str(e)}"
