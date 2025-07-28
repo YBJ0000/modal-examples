@@ -3,7 +3,7 @@
 # mypy: ignore-errors
 # ---
 
-# # Run a job queue for olmOCR
+# # Run a job queue for olmOCR with vLLM acceleration
 
 # This tutorial shows you how to use Modal as an infinitely scalable job queue
 # that can service async tasks from a web app. For the purpose of this tutorial,
@@ -15,6 +15,7 @@
 # Our job queue will handle a single task: running OCR transcription for images of receipts and documents.
 # We'll make use of olmOCR: a toolkit for converting PDFs and other image-based document formats 
 # into clean, readable, plain text format using a 7B parameter Vision Language Model.
+# This version uses vLLM for accelerated inference.
 
 # ## Define an App
 
@@ -24,11 +25,12 @@
 from typing import Optional
 import modal
 
-app = modal.App("example-doc-ocr-jobs")  # 改为与 GOT-OCR 版本相同的名称
+app = modal.App("example-doc-ocr-jobs")
 
 # We define the dependencies for our Function by specifying an
 # [Image](https://modal.com/docs/guide/images).
 # olmOCR requires specific dependencies including poppler-utils for PDF processing.
+# We also add vLLM for accelerated inference.
 
 inference_image = (
     modal.Image.debian_slim(python_version="3.11")
@@ -54,8 +56,12 @@ inference_image = (
         "safetensors",
         "Pillow"
     )
-    # Install olmOCR
-    .pip_install("olmocr[gpu]")
+    # Install vLLM for accelerated inference (支持多模态)
+    .pip_install("vllm>=0.7.2")
+    # Install latest olmOCR with GPU support
+    .pip_install("olmocr[gpu]>=0.2.1")
+    # Install qwen-vl-utils for easier multimodal handling
+    .pip_install("qwen-vl-utils")
 )
 
 # ## Cache the pre-trained model on a Modal Volume
@@ -72,10 +78,43 @@ inference_image = inference_image.env({
     "HF_HOME": MODEL_CACHE_PATH,
     "TRANSFORMERS_CACHE": MODEL_CACHE_PATH,
     "HF_HUB_CACHE": MODEL_CACHE_PATH,
-    "HF_HUB_ENABLE_HF_TRANSFER": "1"
+    "HF_HUB_ENABLE_HF_TRANSFER": "1",
+    # vLLM性能优化环境变量
+    "CUDA_LAUNCH_BLOCKING": "0",
+    "TORCH_CUDNN_V8_API_ENABLED": "1",
+    "PYTORCH_CUDA_ALLOC_CONF": "max_split_size_mb:128",
+    "TOKENIZERS_PARALLELISM": "false"
 })
 
-# ## Run OCR inference on Modal using optimized approach
+# ## Global vLLM engine instance for reuse across requests
+
+vllm_engine = None
+
+def get_vllm_engine():
+    """Initialize and return vLLM engine with optimized settings"""
+    global vllm_engine
+    if vllm_engine is None:
+        from vllm import LLM
+        print("Initializing vLLM engine...")
+        
+        # vLLM引擎配置，基于olmOCR官方推荐参数
+        vllm_engine = LLM(
+            model="allenai/olmOCR-7B-0225-preview",
+            trust_remote_code=True,
+            dtype="bfloat16",
+            # 性能优化参数
+            gpu_memory_utilization=0.9,  # 使用90%的GPU内存
+            max_model_len=8192,  # 根据需要调整最大序列长度
+            tensor_parallel_size=1,  # 单GPU设置
+            # 多模态支持
+            limit_mm_per_prompt={"image": 1},  # 每个prompt最多1张图片
+            max_num_seqs=1,  # 批处理大小，OCR任务通常单个处理
+        )
+        print("vLLM engine initialized successfully")
+    
+    return vllm_engine
+
+# ## Run OCR inference on Modal using vLLM acceleration
 
 # Using the [`@app.function`](https://modal.com/docs/reference/modal.App#function)
 # decorator with model caching for optimal performance.
@@ -88,40 +127,32 @@ inference_image = inference_image.env({
     volumes={MODEL_CACHE_PATH: model_cache},
     image=inference_image,
     timeout=600,  # 10 minutes timeout for processing
+    # 添加性能优化参数
+    keep_warm=1,  # 保持一个实例热启动
+    container_idle_timeout=300,  # 5分钟空闲超时
 )
 def parse_receipt(image: bytes) -> str:
     """
-    Optimized olmOCR implementation using Python API with model caching.
-    This avoids the overhead of subprocess calls and model reloading.
+    Optimized olmOCR implementation using vLLM for accelerated inference.
+    This provides significant speed improvements over the standard transformers approach.
     """
     import tempfile
     import base64
-    import torch
     from io import BytesIO
     from PIL import Image
     from pathlib import Path
-    from transformers import AutoProcessor, Qwen2VLForConditionalGeneration
+    from vllm import SamplingParams
+    from qwen_vl_utils import process_vision_info
     
-    # Import olmOCR modules
+    # Import olmOCR modules for preprocessing
     from olmocr.data.renderpdf import render_pdf_to_base64png
     from olmocr.prompts import build_finetuning_prompt
     from olmocr.prompts.anchor import get_anchor_text
     
-    # Load model and processor (will be cached by Modal)
-    print("Loading olmOCR model and processor...")
+    # Get the vLLM engine (initialized once and reused)
+    llm = get_vllm_engine()
     
-    model = Qwen2VLForConditionalGeneration.from_pretrained(
-        "allenai/olmOCR-7B-0225-preview", 
-        torch_dtype=torch.bfloat16
-    ).eval()
-    
-    processor = AutoProcessor.from_pretrained("Qwen/Qwen2-VL-7B-Instruct")
-    
-    # Move model to GPU
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    model.to(device)
-    
-    print(f"Model loaded successfully on {device}")
+    print("Processing document with vLLM-accelerated olmOCR...")
     
     try:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -134,14 +165,14 @@ def parse_receipt(image: bytes) -> str:
                 with open(pdf_path, "wb") as f:
                     f.write(image)
                 
-                # Render PDF page to base64 image (fixed parameter order)
+                # Render PDF page to base64 image
                 image_base64 = render_pdf_to_base64png(
                     str(pdf_path), 
                     1,  # page number as positional argument
                     target_longest_image_dim=1024
                 )
                 
-                # Get anchor text for document metadata (fixed parameter order)
+                # Get anchor text for document metadata
                 anchor_text = get_anchor_text(
                     str(pdf_path), 
                     1,  # page number as positional argument
@@ -167,7 +198,7 @@ def parse_receipt(image: bytes) -> str:
             # Build the prompt using olmOCR's prompt building system
             prompt = build_finetuning_prompt(anchor_text)
             
-            # Build the full prompt for the model
+            # Build the multimodal message for vLLM
             messages = [
                 {
                     "role": "user",
@@ -178,51 +209,36 @@ def parse_receipt(image: bytes) -> str:
                 }
             ]
             
-            # Apply chat template and process
-            text = processor.apply_chat_template(
-                messages, 
-                tokenize=False, 
-                add_generation_prompt=True
+            print("Running vLLM inference...")
+            
+            # Configure sampling parameters for OCR (deterministic output)
+            sampling_params = SamplingParams(
+                max_tokens=2048,  # Increased for longer documents
+                temperature=0.0,  # Deterministic output for OCR
+                top_p=1.0,
+                stop=None,
+                # 移除无效参数，vLLM会自动处理
             )
             
-            # Decode base64 image for processing
-            main_image = Image.open(BytesIO(base64.b64decode(image_base64)))
-            
-            # Process inputs
-            inputs = processor(
-                text=[text],
-                images=[main_image],
-                padding=True,
-                return_tensors="pt",
-            )
-            inputs = {key: value.to(device) for (key, value) in inputs.items()}
-            
-            print("Running olmOCR inference...")
-            
-            # Generate output using the model
-            with torch.no_grad():
-                output = model.generate(
-                    **inputs,
-                    temperature=0.8,
-                    max_new_tokens=2048,  # Increased for longer documents
-                    num_return_sequences=1,
-                    do_sample=True,
-                )
-            
-            # Decode the output
-            prompt_length = inputs["input_ids"].shape[1]
-            new_tokens = output[:, prompt_length:]
-            text_output = processor.tokenizer.batch_decode(
-                new_tokens, skip_special_tokens=True
+            # Generate output using vLLM
+            outputs = llm.chat(
+                messages=messages,
+                sampling_params=sampling_params,
+                use_tqdm=False
             )
             
-            result = text_output[0] if text_output else "No output generated"
-            print(f"olmOCR processing completed. Output length: {len(result)} characters")
+            # Extract the generated text
+            if outputs and len(outputs) > 0:
+                result = outputs[0].outputs[0].text.strip()
+            else:
+                result = "No output generated"
+            
+            print(f"vLLM olmOCR processing completed. Output length: {len(result)} characters")
             
             return result
             
     except Exception as e:
-        error_msg = f"olmOCR processing failed: {str(e)}"
+        error_msg = f"vLLM olmOCR processing failed: {str(e)}"
         print(error_msg)
         return error_msg
 
@@ -265,14 +281,14 @@ def main(receipt_filename: Optional[str] = None):
 
     if receipt_filename.exists():
         image = receipt_filename.read_bytes()
-        print(f"running optimized olmOCR on {receipt_filename}")
+        print(f"running vLLM-accelerated olmOCR on {receipt_filename}")
     else:
         # Use a sample PDF for testing
         receipt_url = "https://olmocr.allenai.org/papers/olmocr_3pg_sample.pdf"
         request = urllib.request.Request(receipt_url)
         with urllib.request.urlopen(request) as response:
             image = response.read()
-        print(f"running optimized olmOCR on sample PDF from URL {receipt_url}")
+        print(f"running vLLM-accelerated olmOCR on sample PDF from URL {receipt_url}")
     
     result = parse_receipt.remote(image)
     print("=" * 50)
