@@ -104,12 +104,12 @@ def get_vllm_engine():
             trust_remote_code=True,
             dtype="bfloat16",
             # 性能优化参数
-            gpu_memory_utilization=0.9,  # 使用90%的GPU内存
+            gpu_memory_utilization=0.95,  # 使用95%的GPU内存
             max_model_len=8192,  # 根据需要调整最大序列长度
             tensor_parallel_size=1,  # 单GPU设置
             # 多模态支持
             limit_mm_per_prompt={"image": 1},  # 每个prompt最多1张图片
-            max_num_seqs=1,  # 批处理大小，OCR任务通常单个处理
+            max_num_seqs=3,  # 支持批处理
         )
         print("vLLM engine initialized successfully")
     
@@ -172,79 +172,111 @@ def parse_receipt(image: bytes) -> str:
                     pdf_reader = PyPDF2.PdfReader(pdf_file)
                     total_pages = len(pdf_reader.pages)
                 
-                print(f"Processing PDF with {total_pages} pages...")
-                
-                all_results = []
-                
-                # Process each page
-                for page_num in range(1, total_pages + 1):
-                    print(f"Processing page {page_num}/{total_pages}...")
+                def process_pdf_batch(pdf_path, total_pages, batch_size=3):
+                    """批量处理PDF页面"""
+                    llm = get_vllm_engine()
+                    all_results = {}
                     
-                    try:
-                        # Render current page to base64 image
-                        image_base64 = render_pdf_to_base64png(
-                            str(pdf_path), 
-                            page_num,  # current page number
-                            target_longest_image_dim=1024
-                        )
+                    # 分批处理
+                    for batch_start in range(1, total_pages + 1, batch_size):
+                        batch_end = min(batch_start + batch_size - 1, total_pages)
+                        batch_pages = list(range(batch_start, batch_end + 1))
                         
-                        # Get anchor text for current page
-                        anchor_text = get_anchor_text(
-                            str(pdf_path), 
-                            page_num,  # current page number
-                            pdf_engine="pdfreport", 
-                            target_length=4000
-                        )
+                        print(f"Processing batch: pages {batch_pages}")
                         
-                        # Build the prompt using olmOCR's prompt building system
-                        prompt = build_finetuning_prompt(anchor_text)
+                        # 准备批量消息
+                        batch_messages = []
+                        for page_num in batch_pages:
+                            try:
+                                # 渲染页面
+                                image_base64 = render_pdf_to_base64png(
+                                    str(pdf_path), 
+                                    page_num,
+                                    target_longest_image_dim=1024
+                                )
+                                
+                                # 获取锚点文本
+                                anchor_text = get_anchor_text(
+                                    str(pdf_path), 
+                                    page_num,
+                                    pdf_engine="pdfreport", 
+                                    target_length=4000
+                                )
+                                
+                                # 构建提示
+                                prompt = build_finetuning_prompt(anchor_text)
+                                
+                                # 构建消息
+                                messages = [
+                                    {
+                                        "role": "user",
+                                        "content": [
+                                            {"type": "text", "text": prompt},
+                                            {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{image_base64}"}},
+                                        ],
+                                    }
+                                ]
+                                
+                                batch_messages.append(messages)
+                                
+                            except Exception as e:
+                                print(f"Error preparing page {page_num}: {e}")
+                                all_results[page_num] = f"[Error preparing page: {e}]"
                         
-                        # Build the multimodal message for vLLM
-                        messages = [
-                            {
-                                "role": "user",
-                                "content": [
-                                    {"type": "text", "text": prompt},
-                                    {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{image_base64}"}},
-                                ],
-                            }
-                        ]
-                        
-                        # Configure sampling parameters for OCR (deterministic output)
-                        sampling_params = SamplingParams(
-                            max_tokens=2048,  # Increased for longer documents
-                            temperature=0.0,  # Deterministic output for OCR
-                            top_p=1.0,
-                            stop=None,
-                        )
-                        
-                        # Generate output using vLLM
-                        outputs = llm.chat(
-                            messages=messages,
-                            sampling_params=sampling_params,
-                            use_tqdm=False
-                        )
-                        
-                        # Extract the generated text
-                        if outputs and len(outputs) > 0:
-                            page_result = outputs[0].outputs[0].text.strip()
-                            if page_result:
-                                all_results.append(f"# Page {page_num}\n\n{page_result}")
-                                print(f"Page {page_num} processed successfully ({len(page_result)} characters)")
-                            else:
-                                print(f"Page {page_num} returned empty result")
-                        else:
-                            print(f"Page {page_num} failed to generate output")
-                            
-                    except Exception as page_error:
-                        error_msg = f"Error processing page {page_num}: {str(page_error)}"
-                        print(error_msg)
-                        all_results.append(f"# Page {page_num}\n\n[Error processing this page: {str(page_error)}]")
+                        # 批量推理
+                        if batch_messages:
+                            try:
+                                sampling_params = SamplingParams(
+                                    max_tokens=2048,
+                                    temperature=0.0,
+                                    top_p=1.0,
+                                    stop=None,
+                                )
+                                
+                                # 关键：一次性处理多个请求
+                                outputs = llm.chat(
+                                    messages=batch_messages,  # 传入多个messages
+                                    sampling_params=sampling_params,
+                                    use_tqdm=False
+                                )
+                                
+                                # 处理结果
+                                for i, output in enumerate(outputs):
+                                    page_num = batch_pages[i]
+                                    if output.outputs:
+                                        result = output.outputs[0].text.strip()
+                                        all_results[page_num] = result
+                                        print(f"Page {page_num} processed successfully ({len(result)} characters)")
+                                    else:
+                                        all_results[page_num] = "[No output generated]"
+                                        
+                            except Exception as e:
+                                print(f"Batch processing error: {e}")
+                                for page_num in batch_pages:
+                                    all_results[page_num] = f"[Batch error: {e}]"
+                    
+                    return all_results
                 
-                # Combine all page results
-                if all_results:
+                # 修改主函数中的PDF处理部分
+                # 将原来的for循环替换为：
+                if image.startswith(b'%PDF'):
+                    # ... PDF准备代码 ...
+                    
+                    print(f"Processing PDF with {total_pages} pages using batch processing...")
+                    
+                    # 使用批处理
+                    page_results = process_pdf_batch(pdf_path, total_pages, batch_size=3)
+                    
+                    # 组合结果
+                    all_results = []
+                    for page_num in range(1, total_pages + 1):
+                        if page_num in page_results:
+                            all_results.append(f"# Page {page_num}\n\n{page_results[page_num]}")
+                        else:
+                            all_results.append(f"# Page {page_num}\n\n[Error: Page not processed]")
+                    
                     final_result = "\n\n---\n\n".join(all_results)
-                    print(f"Multi-page PDF processing completed. Total output length: {len(final_result)} characters")
+                    print(f"Batch PDF processing completed. Total output length: {len(final_result)} characters")
                     return final_result
                 else:
                     return "Error: No pages could be processed successfully."
