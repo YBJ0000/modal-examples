@@ -109,7 +109,7 @@ def get_vllm_engine():
             tensor_parallel_size=1,  # 单GPU设置
             # 多模态支持
             limit_mm_per_prompt={"image": 1},  # 每个prompt最多1张图片
-            max_num_seqs=12,  # 支持批处理
+            max_num_seqs=3,  # 支持批处理
         )
         print("vLLM engine initialized successfully")
     
@@ -172,7 +172,7 @@ def parse_receipt(image: bytes) -> str:
                     pdf_reader = PyPDF2.PdfReader(pdf_file)
                     total_pages = len(pdf_reader.pages)
                 
-                def process_pdf_batch(pdf_path, total_pages, batch_size=12):
+                def process_pdf_batch(pdf_path, total_pages, batch_size=3):
                     """批量处理PDF页面"""
                     llm = get_vllm_engine()
                     all_results = {}
@@ -265,7 +265,7 @@ def parse_receipt(image: bytes) -> str:
                     print(f"Processing PDF with {total_pages} pages using batch processing...")
                     
                     # 使用批处理
-                    page_results = process_pdf_batch(pdf_path, total_pages, batch_size=12)
+                    page_results = process_pdf_batch(pdf_path, total_pages, batch_size=3)
                     
                     # 组合结果
                     all_results = []
