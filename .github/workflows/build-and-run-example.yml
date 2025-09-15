@@ -2,8 +2,8 @@ name: Build and run example
 
 on:
   workflow_dispatch:
-  schedule:
-    - cron: "23 * * * *"
+  # schedule:
+  #   - cron: "23 * * * *"
 
 env:
   TERM: linux
